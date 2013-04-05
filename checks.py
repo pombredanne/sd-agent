@@ -2591,6 +2591,7 @@ class checks:
 
 			try:
 				payload = json.dumps(checksData, encoding='latin1').encode('utf-8')
+				payload = "".join(i for i in payload if ord(i)<128)
 
 			except Exception, e:
 				import traceback
