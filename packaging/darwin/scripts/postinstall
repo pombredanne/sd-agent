@@ -1,0 +1,13 @@
+#!/bin/sh
+
+mkdir -p /var/log/sd-agent/
+mkdir -p /var/run/sd-agent/
+chown -R sd-agent:sd-agent /var/log/sd-agent/
+chown -R sd-agent:sd-agent /var/run/sd-agent/
+chown -R sd-agent:sd-agent /usr/local/etc/sd-agent/
+chmod 0660 /usr/local/etc/sd-agent/config.cfg
+chmod 0660 /usr/local/etc/sd-agent/plugins.cfg
+
+# Install launchd control file
+cp /usr/local/sd-agent/com.serverdensity.agent.plist /Library/LaunchDaemons
+launchctl load /Library/LaunchDaemons/com.serverdensity.agent.plist &> /dev/null

@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# Create sd-agent user if it doesn't exist
+user="sd-agent"
+group="sd-agent"
+
+dscl=/usr/bin/dscl
+$dscl . -read "/Users/${user}" &> /dev/null || {
+    # We need to find a free UID/GID
+    uid=200
+    while $($dscl . -list /Users uid | grep -q "\b${uid}$") || \
+        $($dscl . -list /Users gid | grep -q "\b${uid}$"); do
+        uid=$((${uid} + 1))
+    done
+    $dscl . -create /Groups/${group}
+    $dscl . -create /Groups/${group} PrimaryGroupID ${uid}
+    $dscl . -create /Groups/${group} Password "*"
+    $dscl . -create /Groups/${group} RealName "Server Density Agent Group"
+    $dscl . -create /Users/${user}
+    $dscl . -create /Users/${user} UserShell /usr/bin/false
+    $dscl . -create /Users/${user} NFSHomeDirectory /var/empty
+    $dscl . -create /Users/${user} PrimaryGroupID ${uid}
+    $dscl . -create /Users/${user} UniqueID ${uid}
+    $dscl . -create /Users/${user} Password "*"
+    $dscl . -create /Users/${user} RealName "Server Density Agent User"
+}
+
+# Stop the service if it was already installed
+/bin/launchctl unload /Library/LaunchDaemons/com.serverdensity.agent.plist &> /dev/null

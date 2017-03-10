@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>UserName</key>
+	<string>sd-agent</string>
+	<key>GroupName</key>
+	<string>sd-agent</string>
+	<key>Label</key>
+	<string>com.serverdensity.agent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/sd-agent/bin/python</string>
+		<string>/usr/local/sd-agent/agent.py</string>
+		<string>foreground</string>
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>WorkingDirectory</key>
+	<string>/usr/local/sd-agent</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>LANG</key>
+		<string>en_EN</string>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/var/log/sd-agent/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/sd-agent/launchd.log</string>
+</dict>
+</plist>

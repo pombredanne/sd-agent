@@ -1,0 +1,128 @@
+sudo: false
+
+branches:
+  only:
+    - master
+    - /^\d+\.\d+\.x$/  # release forked patches branch.
+    - /^\d+\.\d+\.\d+/ # tags format to we get releases pushed.
+
+language: python
+python:
+  - 2.6
+  - 2.7
+
+matrix:
+  fast_finish: true
+  include:
+    - os: osx
+      language: generic
+      python:
+      env: TRAVIS_FLAVOR=default
+
+cache:
+  directories:
+    - $HOME/virtualenv/python$TRAVIS_PYTHON_VERSION.9
+    - vendor/cache
+
+
+env:
+  global:
+    - CONCURRENCY=2
+    - NOSE_FILTER="not windows"
+    - INTEGRATIONS_DIR=$HOME/embedded
+    - PIP_CACHE=$HOME/.cache/pip
+    - SKIP_CLEANUP=true
+    - VOLATILE_DIR=/tmp
+    - DD_CASHER_DIR=/tmp/casher
+    - AGENT_VERSION=2.1.5
+  matrix:
+    - TRAVIS_FLAVOR=default
+    - TRAVIS_FLAVOR=core_integration
+    - TRAVIS_FLAVOR=checks_mock
+    - TRAVIS_FLAVOR=activemq
+    - TRAVIS_FLAVOR=apache
+    #- TRAVIS_FLAVOR=cassandra FLAVOR_VERSION=2.0.13
+    #- TRAVIS_FLAVOR=cassandra FLAVOR_VERSION=2.1.3
+    - TRAVIS_FLAVOR=couchdb
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=0.90.13
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=1.0.3
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=1.1.2
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=1.2.4
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=1.3.9
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=1.4.5
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=1.5.2
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=1.6.2
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=1.7.4
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=2.0.2
+    - TRAVIS_FLAVOR=elasticsearch FLAVOR_VERSION=2.1.1
+    #- TRAVIS_FLAVOR=etcd
+    #- TRAVIS_FLAVOR=fluentd
+    #- TRAVIS_FLAVOR=go_expvar
+    # FIXME: cannot enable gearman on Travis right now
+    # because it needs boost
+    # - TRAVIS_FLAVOR=gearman
+    - TRAVIS_FLAVOR=haproxy FLAVOR_VERSION=1.3.27
+    - TRAVIS_FLAVOR=haproxy FLAVOR_VERSION=1.4.26
+    - TRAVIS_FLAVOR=haproxy FLAVOR_VERSION=1.5.11
+    #- TRAVIS_FLAVOR=kong FLAVOR_VERSION=0.8.1
+    - TRAVIS_FLAVOR=lighttpd
+    - TRAVIS_FLAVOR=memcache
+    - TRAVIS_FLAVOR=mongo FLAVOR_VERSION=2.6.9
+    - TRAVIS_FLAVOR=mongo FLAVOR_VERSION=3.0.1
+    - TRAVIS_FLAVOR=mysql
+    - TRAVIS_FLAVOR=network
+    - TRAVIS_FLAVOR=nginx FLAVOR_VERSION=1.6.2
+    - TRAVIS_FLAVOR=nginx FLAVOR_VERSION=1.7.11
+    #- TRAVIS_FLAVOR=pgbouncer
+    - TRAVIS_FLAVOR=phpfpm
+    - TRAVIS_FLAVOR=postgres FLAVOR_VERSION=9.0.19
+    - TRAVIS_FLAVOR=postgres FLAVOR_VERSION=9.1.15
+    - TRAVIS_FLAVOR=postgres FLAVOR_VERSION=9.2.10
+    - TRAVIS_FLAVOR=postgres FLAVOR_VERSION=9.3.6
+    - TRAVIS_FLAVOR=postgres FLAVOR_VERSION=9.4.1
+    #- TRAVIS_FLAVOR=powerdns_recursor
+    - TRAVIS_FLAVOR=rabbitmq
+    - TRAVIS_FLAVOR=redis FLAVOR_VERSION=2.4.18
+    - TRAVIS_FLAVOR=redis FLAVOR_VERSION=2.6.17
+    - TRAVIS_FLAVOR=redis FLAVOR_VERSION=2.8.19
+# Compilation takes too much time on Travis
+#   - TRAVIS_FLAVOR=riak
+    #- TRAVIS_FLAVOR=snmpd
+    #- TRAVIS_FLAVOR=ssh
+    - TRAVIS_FLAVOR=supervisord
+    - TRAVIS_FLAVOR=sysstat
+# FIXME: reenable, but right now cannot run on Travis because
+# hugepages are enabled
+#    - TRAVIS_FLAVOR=tokumx
+    #- TRAVIS_FLAVOR=tomcat # JMX testing machine / need the other ones before
+    - TRAVIS_FLAVOR=varnish FLAVOR_VERSION=3.0.7
+    - TRAVIS_FLAVOR=varnish FLAVOR_VERSION=4.0.3
+    - TRAVIS_FLAVOR=zookeeper FLAVOR_VERSION=3.4.7
+    - TRAVIS_FLAVOR=zookeeper FLAVOR_VERSION=3.3.6
+
+# Override travis defaults with empty jobs
+before_install: echo "OVERRIDING TRAVIS STEPS"
+install: echo "OVERRIDING TRAVIS STEPS"
+before_script: echo "OVERRIDING TRAVIS STEPS"
+
+script:
+  - travis_retry ./.travis/build_installer.sh
+
+after_failure:
+  - echo "Logs from installation process come here / DEBUG LOGS"
+  - cat /tmp/ci.log
+
+notifications:
+  slack:
+    secure: N7WQuQNLn4wJqGHnLmTOZL18NGdr7vKNyHSV0TnXcgijnoqt+yxOq7mEu+h/KLgflAQObyKF8A3ChmbTB99xL6fR8xYVvxLSPk7+g9PU6Vf7absN9yY0rUQfXcPLVyYsZ11R1UqkizYbxc9B2A588S48/TMP2KB6LnII+PNajyg=
+
+deploy:
+  - provider: releases
+    api_key:
+      secure: "Z36hDHOTIfCHG3q6KTKsSA9V3S8QyRqgpZirR2RlWQinJx1xt9K3V8zIG4DheRNYxwB2z8K4tuyEX3JXLovKXfGSDsT7Tq2nfH7YRQlMP3jqNB8H7CzsTQlFdXM8lBXyalSamNVa/UdZZHHBDCQjk8ZKm/TlsBY626d6NdgXwWM="
+    skip_cleanup: true
+    file: sd-agent-$AGENT_VERSION.dmg
+    on:
+      tags: true
+      condition: $TRAVIS_OS_NAME == osx
+      repo: serverdensity/sd-agent

@@ -1,513 +1,417 @@
-#!/usr/bin/env python
+#!/usr/share/python/sd-agent/bin/python
 '''
     Server Density
     www.serverdensity.com
     ----
-    Server monitoring agent for Linux, FreeBSD and Mac OS X
-
     Licensed under Simplified BSD License (see LICENSE)
+    (C) Server Density 2009-2015 all rights reserved
+    (C) Datadog, Inc. 2010-2016 all rights reserved
 '''
+# set up logging before importing any other components
+from config import get_version, initialize_logging  # noqa
+initialize_logging('collector')
 
+# stdlib
 import logging
-
-# General config
-agentConfig = {}
-agentConfig['logging'] = logging.INFO
-agentConfig['checkFreq'] = 60
-
-agentConfig['version'] = '1.12.4'
-
-rawConfig = {}
-
-# Check we're not using an old version of Python. Do this before anything else
-# We need 2.4 above because some modules (like subprocess) were only introduced in 2.4.
-import sys
-if int(sys.version_info[1]) <= 3:
-    print 'You are using an outdated version of Python. Please update to v2.4 or above (v3 is not supported). For newer OSs, you can update Python without affecting your system install. See http://blog.boxedice.com/2010/01/19/updating-python-on-rhelcentos/ If you are running RHEl 4 / CentOS 4 then you will need to compile Python manually.'
-    sys.exit(1)
-
-# Core modules
-import ConfigParser
-import glob
 import os
-import re
-import sched
+import signal
+import sys
 import time
 
-# After the version check as this isn't available on older Python versions
-# and will error before the message is shown
-import subprocess
+# For pickle & PID files, see issue 293
+os.umask(022)
 
-# Custom modules
-from checks import checks
-from daemon import Daemon
+# project
+from checks.check_status import CollectorStatus
+from checks.collector import Collector
+from config import (
+    get_config,
+    get_parsed_args,
+    get_system_stats,
+    load_check_directory,
+)
+from daemon import AgentSupervisor, Daemon
+from emitter import http_emitter
+from util import (
+    EC2,
+    get_hostname,
+    Watchdog,
+)
+from utils.configcheck import configcheck, sd_configcheck
+from utils.jmx import jmx_command
+from utils.pidfile import PidFile
+from utils.profile import AgentProfiler
+from utils.service_discovery.config_stores import get_config_store
+from utils.service_discovery.sd_backend import get_sd_backend
 
-# Config handling
-try:
-    path = os.path.realpath(__file__)
-    path = os.path.dirname(path)
+# Constants
+PID_NAME = "sd-agent"
+PID_DIR = None
+WATCHDOG_MULTIPLIER = 10
+RESTART_INTERVAL = 4 * 24 * 60 * 60  # Defaults to 4 days
+START_COMMANDS = ['start', 'restart', 'foreground']
+SD_AGENT_COMMANDS = ['check', 'jmx']
 
-    config = ConfigParser.ConfigParser()
+DEFAULT_COLLECTOR_PROFILE_INTERVAL = 20
 
-    if os.path.exists('/etc/sd-agent/conf.d/'):
-        configPath = '/etc/sd-agent/conf.d/'
-    elif os.path.exists('/etc/sd-agent/config.cfg'):
-        configPath = '/etc/sd-agent/config.cfg'
-    else:
-        configPath = path + '/config.cfg'
+# Globals
+log = logging.getLogger('collector')
 
-    if os.access(configPath, os.R_OK) == False:
-        print 'Unable to read the config file at ' + configPath
-        print 'Agent will now quit'
-        sys.exit(1)
 
-    if os.path.isdir(configPath):
-       for configFile in glob.glob(os.path.join(configPath, "*.cfg")):
-           config.read(configFile)
-    else:
-       config.read(configPath)
+class Agent(Daemon):
+    """
+    The agent class is a daemon that runs the collector in a background process.
+    """
 
-    # Core config
-    agentConfig['sdUrl'] = config.get('Main', 'sd_url')
+    def __init__(self, pidfile, autorestart, start_event=True, in_developer_mode=False):
+        Daemon.__init__(self, pidfile, autorestart=autorestart)
+        self.run_forever = True
+        self.collector = None
+        self.start_event = start_event
+        self.in_developer_mode = in_developer_mode
+        self._agentConfig = {}
+        self._checksd = []
+        self.collector_profile_interval = DEFAULT_COLLECTOR_PROFILE_INTERVAL
+        self.check_frequency = None
+        self.reload_configs_flag = False
+        self.sd_backend = None
 
-    if agentConfig['sdUrl'].endswith('/'):
-        agentConfig['sdUrl'] = agentConfig['sdUrl'][:-1]
+    def _handle_sigterm(self, signum, frame):
+        """Handles SIGTERM and SIGINT, which gracefully stops the agent."""
+        log.debug("Caught sigterm. Stopping run loop.")
+        self.run_forever = False
 
-    agentConfig['agentKey'] = config.get('Main', 'agent_key')
+        if self.collector:
+            self.collector.stop()
+        log.debug("Collector is stopped.")
 
-    # Tmp path
-    if os.path.exists('/var/log/sd-agent/'):
-        agentConfig['tmpDirectory'] = '/var/log/sd-agent/'
-    else:
-        agentConfig['tmpDirectory'] = '/tmp/' # default which may be overriden in the config later
+    def _handle_sigusr1(self, signum, frame):
+        """Handles SIGUSR1, which signals an exit with an autorestart."""
+        self._handle_sigterm(signum, frame)
+        self._do_restart()
 
-    agentConfig['pidfileDirectory'] = agentConfig['tmpDirectory']
+    def _handle_sighup(self, signum, frame):
+        """Handles SIGHUP, which signals a configuration reload."""
+        log.info("SIGHUP caught! Scheduling configuration reload before next collection run.")
+        self.reload_configs_flag = True
 
-    # Plugin config
-    if config.has_option('Main', 'plugin_directory'):
-        agentConfig['pluginDirectory'] = config.get('Main', 'plugin_directory')
+    def reload_configs(self):
+        """Reloads the agent configuration and checksd configurations."""
+        log.info("Attempting a configuration reload...")
 
-    # Optional config
-    # Also do not need to be present in the config file (case 28326).
-    if config.has_option('Main', 'apache_status_url'):
-        agentConfig['apacheStatusUrl'] = config.get('Main', 'apache_status_url')
+        # Stop checks
+        for check in self._checksd.get('initialized_checks', []):
+            check.stop()
 
-    if config.has_option('Main', 'apache_status_user'):
-        agentConfig['apacheStatusUser'] = config.get('Main', 'apache_status_user')
+        # Reload checksd configs
+        hostname = get_hostname(self._agentConfig)
+        self._checksd = load_check_directory(self._agentConfig, hostname)
 
-    if config.has_option('Main', 'apache_status_pass'):
-        agentConfig['apacheStatusPass'] = config.get('Main', 'apache_status_pass')
+        # Logging
+        num_checks = len(self._checksd['initialized_checks'])
+        if num_checks > 0:
+            log.info("Successfully reloaded {num_checks} checks".
+                     format(num_checks=num_checks))
+        else:
+            log.info("No checksd configs found")
 
-    if config.has_option('Main', 'logging_level'):
-        # Maps log levels from the configuration file to Python log levels
-        loggingLevelMapping = {
-            'debug'    : logging.DEBUG,
-            'info'     : logging.INFO,
-            'error'    : logging.ERROR,
-            'warn'     : logging.WARN,
-            'warning'  : logging.WARNING,
-            'critical' : logging.CRITICAL,
-            'fatal'    : logging.FATAL,
-        }
+    @classmethod
+    def info(cls, verbose=None):
+        logging.getLogger().setLevel(logging.ERROR)
+        return CollectorStatus.print_latest_status(verbose=verbose)
 
-        customLogging = config.get('Main', 'logging_level')
+    def run(self, config=None):
+        """Main loop of the collector"""
 
+        # Gracefully exit on sigterm.
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+        # A SIGUSR1 signals an exit with an autorestart
+        signal.signal(signal.SIGUSR1, self._handle_sigusr1)
+
+        # Handle Keyboard Interrupt
+        signal.signal(signal.SIGINT, self._handle_sigterm)
+
+        # A SIGHUP signals a configuration reload
+        signal.signal(signal.SIGHUP, self._handle_sighup)
+
+        # Save the agent start-up stats.
+        CollectorStatus().persist()
+
+        # Intialize the collector.
+        if not config:
+            config = get_config(parse_args=True)
+
+        self._agentConfig = self._set_agent_config_hostname(config)
+        hostname = get_hostname(self._agentConfig)
+        systemStats = get_system_stats()
+        emitters = self._get_emitters()
+
+        # Initialize service discovery
+        if self._agentConfig.get('service_discovery'):
+            self.sd_backend = get_sd_backend(self._agentConfig)
+
+        # Load the checks.d checks
+        self._checksd = load_check_directory(self._agentConfig, hostname)
+
+        # Initialize the Collector
+        self.collector = Collector(self._agentConfig, emitters, systemStats, hostname)
+
+        # In developer mode, the number of runs to be included in a single collector profile
+        self.collector_profile_interval = self._agentConfig.get('collector_profile_interval',
+                                                                DEFAULT_COLLECTOR_PROFILE_INTERVAL)
+
+        # Configure the watchdog.
+        self.check_frequency = int(self._agentConfig['check_freq'])
+        watchdog = self._get_watchdog(self.check_frequency)
+
+        # Initialize the auto-restarter
+        self.restart_interval = int(self._agentConfig.get('restart_interval', RESTART_INTERVAL))
+        self.agent_start = time.time()
+
+        profiled = False
+        collector_profiled_runs = 0
+
+        # Run the main loop.
+        while self.run_forever:
+            log.debug("Found {num_checks} checks".format(num_checks=len(self._checksd['initialized_checks'])))
+
+            # Setup profiling if necessary
+            if self.in_developer_mode and not profiled:
+                try:
+                    profiler = AgentProfiler()
+                    profiler.enable_profiling()
+                    profiled = True
+                except Exception as e:
+                    log.warn("Cannot enable profiler: %s" % str(e))
+
+            if self.reload_configs_flag:
+                self.reload_configs()
+
+            # Do the work. Pass `configs_reloaded` to let the collector know if it needs to
+            # look for the AgentMetrics check and pop it out.
+            self.collector.run(checksd=self._checksd,
+                               start_event=self.start_event,
+                               configs_reloaded=self.reload_configs_flag)
+
+            self.reload_configs_flag = False
+
+            # Look for change in the config template store.
+            # The self.sd_backend.reload_check_configs flag is set
+            # to True if a config reload is needed.
+            if self._agentConfig.get('service_discovery') and self.sd_backend and \
+               not self.sd_backend.reload_check_configs:
+                try:
+                    self.sd_backend.reload_check_configs = get_config_store(
+                        self._agentConfig).crawl_config_template()
+                except Exception as e:
+                    log.warn('Something went wrong while looking for config template changes: %s' % str(e))
+
+            # Check if we should run service discovery
+            # The `reload_check_configs` flag can be set through the docker_daemon check or
+            # using ConfigStore.crawl_config_template
+            if self._agentConfig.get('service_discovery') and self.sd_backend and \
+               self.sd_backend.reload_check_configs:
+                self.reload_configs_flag = True
+                self.sd_backend.reload_check_configs = False
+
+            if profiled:
+                if collector_profiled_runs >= self.collector_profile_interval:
+                    try:
+                        profiler.disable_profiling()
+                        profiled = False
+                        collector_profiled_runs = 0
+                    except Exception as e:
+                        log.warn("Cannot disable profiler: %s" % str(e))
+
+            # Check if we should restart.
+            if self.autorestart and self._should_restart():
+                self._do_restart()
+
+            # Only plan for next loop if we will continue, otherwise exit quickly.
+            if self.run_forever:
+                if watchdog:
+                    watchdog.reset()
+                if profiled:
+                    collector_profiled_runs += 1
+                log.debug("Sleeping for {0} seconds".format(self.check_frequency))
+                time.sleep(self.check_frequency)
+
+        # Now clean-up.
         try:
-            agentConfig['logging'] = loggingLevelMapping[customLogging.lower()]
-
-        except KeyError, ex:
-            agentConfig['logging'] = logging.INFO
-
-    if config.has_option('Main', 'mongodb_server'):
-        agentConfig['MongoDBServer'] = config.get('Main', 'mongodb_server')
-
-    if config.has_option('Main', 'mongodb_dbstats'):
-        agentConfig['MongoDBDBStats'] = config.get('Main', 'mongodb_dbstats')
-
-    if config.has_option('Main', 'mongodb_replset'):
-        agentConfig['MongoDBReplSet'] = config.get('Main', 'mongodb_replset')
-
-    if config.has_option('Main', 'mysql_server'):
-        agentConfig['MySQLServer'] = config.get('Main', 'mysql_server')
-
-    if config.has_option('Main', 'mysql_user'):
-        agentConfig['MySQLUser'] = config.get('Main', 'mysql_user')
-
-    if config.has_option('Main', 'mysql_pass'):
-        agentConfig['MySQLPass'] = config.get('Main', 'mysql_pass')
-
-    if config.has_option('Main', 'mysql_port'):
-        agentConfig['MySQLPort'] = config.get('Main', 'mysql_port')
-
-    if config.has_option('Main', 'mysql_socket'):
-        agentConfig['MySQLSocket'] = config.get('Main', 'mysql_socket')
-
-    if config.has_option('Main', 'mysql_norepl'):
-        agentConfig['MySQLNoRepl'] = config.get('Main', 'mysql_norepl')
-
-    if config.has_option('Main', 'nginx_status_url'):
-        agentConfig['nginxStatusUrl'] = config.get('Main', 'nginx_status_url')
-
-    if config.has_option('Main', 'tmp_directory'):
-        agentConfig['tmpDirectory'] = config.get('Main', 'tmp_directory')
-
-    if config.has_option('Main', 'pidfile_directory'):
-        agentConfig['pidfileDirectory'] = config.get('Main', 'pidfile_directory')
-
-    if config.has_option('Main', 'rabbitmq_status_url'):
-        agentConfig['rabbitMQStatusUrl'] = config.get('Main', 'rabbitmq_status_url')
-
-    if config.has_option('Main', 'rabbitmq_user'):
-        agentConfig['rabbitMQUser'] = config.get('Main', 'rabbitmq_user')
-
-    if config.has_option('Main', 'rabbitmq_pass'):
-        agentConfig['rabbitMQPass'] = config.get('Main', 'rabbitmq_pass')
-
-except ConfigParser.NoSectionError, e:
-    print 'Config file not found or incorrectly formatted'
-    print 'Agent will now quit'
-    sys.exit(1)
-
-except ConfigParser.ParsingError, e:
-    print 'Config file not found or incorrectly formatted'
-    print 'Agent will now quit'
-    sys.exit(1)
-
-except ConfigParser.NoOptionError, e:
-    print 'There are some items missing from your config file, but nothing fatal'
-
-# Check to make sure the default config values have been changed (only core config values)
-if agentConfig['sdUrl'] == 'http://example.serverdensity.com' or agentConfig['agentKey'] == 'keyHere':
-    print 'You have not modified config.cfg for your server'
-    print 'Agent will now quit'
-    sys.exit(1)
-
-# Check to make sure sd_url is in correct
-if (re.match('http(s)?(\:\/\/)[a-zA-Z0-9_\-]+\.(serverdensity.com)', agentConfig['sdUrl']) == None) \
-   and (re.match('http(s)?(\:\/\/)[a-zA-Z0-9_\-]+\.(serverdensity.io)', agentConfig['sdUrl']) == None):
-    print 'Your sd_url is incorrect. It needs to be in the form https://example.serverdensity.com or https://example.serverdensity.io'
-    print 'Agent will now quit'
-    sys.exit(1)
-
-# Check apache_status_url is not empty (case 27073)
-if 'apacheStatusUrl' in agentConfig and agentConfig['apacheStatusUrl'] == None:
-    print 'You must provide a config value for apache_status_url. If you do not wish to use Apache monitoring, leave it as its default value - http://www.example.com/server-status/?auto'
-    print 'Agent will now quit'
-    sys.exit(1)
-
-if 'nginxStatusUrl' in agentConfig and agentConfig['nginxStatusUrl'] == None:
-    print 'You must provide a config value for nginx_status_url. If you do not wish to use Nginx monitoring, leave it as its default value - http://www.example.com/nginx_status'
-    print 'Agent will now quit'
-    sys.exit(1)
-
-if 'MySQLServer' in agentConfig and agentConfig['MySQLServer'] != '' and 'MySQLUser' in agentConfig and agentConfig['MySQLUser'] != '' and 'MySQLPass' in agentConfig:
-    try:
-        import MySQLdb
-    except ImportError:
-        print 'You have configured MySQL for monitoring, but the MySQLdb module is not installed. For more info, see: http://www.serverdensity.com/docs/agent/mysqlstatus/'
-        print 'Agent will now quit'
-        sys.exit(1)
-
-if 'MongoDBServer' in agentConfig and agentConfig['MongoDBServer'] != '':
-    try:
-        import pymongo
-    except ImportError:
-        print 'You have configured MongoDB for monitoring, but the pymongo module is not installed. For more info, see: http://www.serverdensity.com/docs/agent/mongodbstatus/'
-        print 'Agent will now quit'
-        sys.exit(1)
-
-for section in config.sections():
-    rawConfig[section] = {}
-
-    for option in config.options(section):
-        rawConfig[section][option] = config.get(section, option)
-
-# Override the generic daemon class to run our checks
-class agent(Daemon):
-
-    def run(self):
-        mainLogger.debug('Collecting basic system stats')
-
-        # Get some basic system stats to post back for development/testing
-        import platform
-        systemStats = {'machine': platform.machine(), 'platform': sys.platform, 'processor': platform.processor(), 'pythonV': platform.python_version(), 'cpuCores': self.cpuCores()}
-
-        if sys.platform == 'linux2':
-            systemStats['nixV'] = platform.dist()
-
-        elif sys.platform == 'darwin':
-            systemStats['macV'] = platform.mac_ver()
-
-        elif sys.platform.find('freebsd') != -1:
-            version = platform.uname()[2]
-            systemStats['fbsdV'] = ('freebsd', version, '') # no codename for FreeBSD
-
-        mainLogger.info('System: ' + str(systemStats))
-
-        mainLogger.debug('Creating checks instance')
-
-        # Checks instance
-        c = checks(agentConfig, rawConfig, mainLogger)
-
-        # Schedule the checks
-        mainLogger.info('checkFreq: %s', agentConfig['checkFreq'])
-        s = sched.scheduler(time.time, time.sleep)
-        c.doChecks(s, True, systemStats) # start immediately (case 28315)
-        s.run()
-
-    def cpuCores(self):
-        if sys.platform == 'linux2':
-            grep = subprocess.Popen(['grep', 'model name', '/proc/cpuinfo'], stdout=subprocess.PIPE, close_fds=True)
-            wc = subprocess.Popen(['wc', '-l'], stdin=grep.stdout, stdout=subprocess.PIPE, close_fds=True)
-            output = wc.communicate()[0]
-            return int(output)
-
-        if sys.platform == 'darwin':
-            output = subprocess.Popen(['sysctl', 'hw.ncpu'], stdout=subprocess.PIPE, close_fds=True).communicate()[0].split(': ')[1]
-            return int(output)
-
-# Control of daemon
-if __name__ == '__main__':
-
-    # Logging
-    logFile = os.path.join(agentConfig['tmpDirectory'], 'sd-agent.log')
-
-    if os.access(agentConfig['tmpDirectory'], os.W_OK) == False:
-        print 'Unable to write the log file at ' + logFile
-        print 'Agent will now quit'
-        sys.exit(1)
-
-    handler = logging.handlers.RotatingFileHandler(logFile, maxBytes=10485760, backupCount=5) # 10MB files
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-    handler.setFormatter(formatter)
-
-    mainLogger = logging.getLogger('main')
-    mainLogger.setLevel(agentConfig['logging'])
-    mainLogger.addHandler(handler)
-
-    mainLogger.info('--')
-    mainLogger.info('sd-agent %s started', agentConfig['version'])
-    mainLogger.info('--')
-
-    mainLogger.info('sd_url: %s', agentConfig['sdUrl'])
-    mainLogger.info('agent_key: %s', agentConfig['agentKey'])
-
-    argLen = len(sys.argv)
-
-    if argLen == 3 or argLen == 4: # needs to accept case when --clean is passed
-        if sys.argv[2] == 'init':
-            # This path added for newer Linux packages which run under
-            # a separate sd-agent user account.
-            if os.path.exists('/var/run/sd-agent/'):
-                pidFile = '/var/run/sd-agent/sd-agent.pid'
-            else:
-                pidFile = '/var/run/sd-agent.pid'
-
-    else:
-        pidFile = os.path.join(agentConfig['pidfileDirectory'], 'sd-agent.pid')
-
-    if os.access(agentConfig['pidfileDirectory'], os.W_OK) == False:
-        print 'Unable to write the PID file at ' + pidFile
-        print 'Agent will now quit'
-        sys.exit(1)
-
-    mainLogger.info('PID: %s', pidFile)
-
-    if argLen == 4 and sys.argv[3] == '--clean':
-        mainLogger.info('--clean')
-        try:
-            os.remove(pidFile)
-        except OSError:
-            # Did not find pid file
+            CollectorStatus.remove_latest_status()
+        except Exception:
             pass
 
-    # Daemon instance from agent class
-    daemon = agent(pidFile)
-
-    # Control options
-    if argLen == 2 or argLen == 3 or argLen == 4:
-        if 'start' == sys.argv[1]:
-            mainLogger.info('Action: start')
-            daemon.start()
-
-        elif 'stop' == sys.argv[1]:
-            mainLogger.info('Action: stop')
-            daemon.stop()
-
-        elif 'restart' == sys.argv[1]:
-            mainLogger.info('Action: restart')
-            daemon.restart()
-
-        elif 'foreground' == sys.argv[1]:
-            mainLogger.info('Action: foreground')
-            daemon.run()
-
-        elif 'status' == sys.argv[1]:
-            mainLogger.info('Action: status')
-
-            try:
-                pf = file(pidFile,'r')
-                pid = int(pf.read().strip())
-                pf.close()
-            except IOError:
-                pid = None
-            except SystemExit:
-                pid = None
-
-            if pid:
-                print 'sd-agent is running as pid %s.' % pid
-            else:
-                print 'sd-agent is not running.'
-
-        elif 'update' == sys.argv[1]:
-            mainLogger.info('Action: update')
-
-            if os.path.abspath(__file__) == '/usr/bin/sd-agent/agent.py':
-                print 'Please use the Linux package manager that was used to install the agent to update it.'
-                print 'e.g. yum install sd-agent or apt-get install sd-agent'
-                sys.exit(1)
-
-            import httplib
-            import platform
-            import urllib2
-
-            print 'Checking if there is a new version';
-
-            # Get the latest version info
-            try:
-                mainLogger.debug('Update: checking for update')
-
-                request = urllib2.urlopen('http://www.serverdensity.com/agentupdate/')
-                response = request.read()
-
-            except urllib2.HTTPError, e:
-                print 'Unable to get latest version info - HTTPError = ' + str(e)
-                sys.exit(1)
-
-            except urllib2.URLError, e:
-                print 'Unable to get latest version info - URLError = ' + str(e)
-                sys.exit(1)
-
-            except httplib.HTTPException, e:
-                print 'Unable to get latest version info - HTTPException'
-                sys.exit(1)
-
-            except Exception, e:
-                import traceback
-                print 'Unable to get latest version info - Exception = ' + traceback.format_exc()
-                sys.exit(1)
-
-            mainLogger.debug('Update: importing json/minjson')
-
-            # We need to return the data using JSON. As of Python 2.6+, there is a core JSON
-            # module. We have a 2.4/2.5 compatible lib included with the agent but if we're
-            # on 2.6 or above, we should use the core module which will be faster
-            pythonVersion = platform.python_version_tuple()
-
-            # Decode the JSON
-            if int(pythonVersion[1]) >= 6: # Don't bother checking major version since we only support v2 anyway
-                import json
-
-                mainLogger.debug('Update: decoding JSON (json)')
-
-                try:
-                    updateInfo = json.loads(response)
-                except Exception, e:
-                    print 'Unable to get latest version info. Try again later.'
-                    sys.exit(1)
-
-            else:
-                import minjson
-
-                mainLogger.debug('Update: decoding JSON (minjson)')
-
-                try:
-                    updateInfo = minjson.safeRead(response)
-                except Exception, e:
-                    print 'Unable to get latest version info. Try again later.'
-                    sys.exit(1)
-
-            # Do the version check
-            if updateInfo['version'] != agentConfig['version']:
-                import md5 # I know this is depreciated, but we still support Python 2.4 and hashlib is only in 2.5. Case 26918
-                import urllib
-
-                print 'A new version is available.'
-
-                def downloadFile(agentFile, recursed = False):
-                    mainLogger.debug('Update: downloading ' + agentFile['name'])
-                    print 'Downloading ' + agentFile['name']
-
-                    downloadedFile = urllib.urlretrieve('http://www.serverdensity.com/downloads/sd-agent/' + agentFile['name'])
-
-                    # Do md5 check to make sure the file downloaded properly
-                    checksum = md5.new()
-                    f = file(downloadedFile[0], 'rb')
-
-                    # Although the files are small, we can't guarantee the available memory nor that there
-                    # won't be large files in the future, so read the file in small parts (1kb at time)
-                    while True:
-                        part = f.read(1024)
-
-                        if not part:
-                            break # end of file
-
-                        checksum.update(part)
-
-                    f.close()
-
-                    # Do we have a match?
-                    if checksum.hexdigest() == agentFile['md5']:
-                        return downloadedFile[0]
-
-                    else:
-                        # Try once more
-                        if recursed == False:
-                            downloadFile(agentFile, True)
-
-                        else:
-                            print agentFile['name'] + ' did not match its checksum - it is corrupted. This may be caused by network issues so please try again in a moment.'
-                            sys.exit(1)
-
-                # Loop through the new files and call the download function
-                for agentFile in updateInfo['files']:
-                    agentFile['tempFile'] = downloadFile(agentFile)
-
-                # If we got to here then everything worked out fine. However, all the files are still in temporary locations so we need to move them
-                # This is to stop an update breaking a working agent if the update fails halfway through
-                import os
-                import shutil # Prevents [Errno 18] Invalid cross-device link (case 26878) - http://mail.python.org/pipermail/python-list/2005-February/308026.html
-
-                for agentFile in updateInfo['files']:
-                    mainLogger.debug('Update: updating ' + agentFile['name'])
-                    print 'Updating ' + agentFile['name']
-                    installation_path = os.path.dirname(os.path.abspath(__file__))
-                    mainLogger.debug('Update: installation path: ' + installation_path)
-
-                    try:
-                        if os.path.exists(agentFile['name']):
-                            os.remove(os.path.join(installation_path, agentFile['name']))
-
-                        shutil.move(agentFile['tempFile'], os.path.join(installation_path, agentFile['name']))
-
-                    except OSError:
-                        print 'An OS level error occurred. You will need to manually re-install the agent by downloading the latest version from http://www.serverdensity.com/downloads/sd-agent.tar.gz. You can copy your config.cfg to the new install'
-                        sys.exit(1)
-
-                mainLogger.debug('Update: done')
-
-                print 'Update completed. Please restart the agent (python agent.py restart).'
-
-            else:
-                print 'The agent is already up to date'
-
-        else:
-            print 'Unknown command'
-            sys.exit(1)
-
+        # Explicitly kill the process, because it might be running as a daemon.
+        log.info("Exiting. Bye bye.")
         sys.exit(0)
 
-    else:
-        print 'usage: %s start|stop|restart|status|update' % sys.argv[0]
-        sys.exit(1)
+    def _get_emitters(self):
+        return [http_emitter]
+
+    def _get_watchdog(self, check_freq):
+        watchdog = None
+        if self._agentConfig.get("watchdog", True):
+            watchdog = Watchdog(check_freq * WATCHDOG_MULTIPLIER,
+                                max_mem_mb=self._agentConfig.get('limit_memory_consumption', None))
+            watchdog.reset()
+        return watchdog
+
+    def _set_agent_config_hostname(self, agentConfig):
+        # Try to fetch instance Id from EC2 if not hostname has been set
+        # in the config file.
+        # DEPRECATED
+        if agentConfig.get('hostname') is None and agentConfig.get('use_ec2_instance_id'):
+            instanceId = EC2.get_instance_id(agentConfig)
+            if instanceId is not None:
+                log.info("Running on EC2, instanceId: %s" % instanceId)
+                agentConfig['hostname'] = instanceId
+            else:
+                log.info('Not running on EC2, using hostname to identify this server')
+        return agentConfig
+
+    def _should_restart(self):
+        if time.time() - self.agent_start > self.restart_interval:
+            return True
+        return False
+
+    def _do_restart(self):
+        log.info("Running an auto-restart.")
+        if self.collector:
+            self.collector.stop()
+        sys.exit(AgentSupervisor.RESTART_EXIT_STATUS)
+
+
+def main():
+    options, args = get_parsed_args()
+    agentConfig = get_config(options=options)
+    autorestart = agentConfig.get('autorestart', False)
+    hostname = get_hostname(agentConfig)
+    in_developer_mode = agentConfig.get('developer_mode')
+    COMMANDS_AGENT = [
+        'start',
+        'stop',
+        'restart',
+        'status',
+        'foreground',
+    ]
+
+    COMMANDS_NO_AGENT = [
+        'info',
+        'check',
+        'configcheck',
+        'jmx',
+    ]
+
+    COMMANDS = COMMANDS_AGENT + COMMANDS_NO_AGENT
+
+    if len(args) < 1:
+        sys.stderr.write("Usage: %s %s\n" % (sys.argv[0], "|".join(COMMANDS)))
+        return 2
+
+    command = args[0]
+    if command not in COMMANDS:
+        sys.stderr.write("Unknown command: %s\n" % command)
+        return 3
+
+    # Deprecation notice
+    if command not in SD_AGENT_COMMANDS:
+        # Will become an error message and exit after deprecation period
+        from utils.deprecations import deprecate_old_command_line_tools
+        deprecate_old_command_line_tools()
+
+    if command in COMMANDS_AGENT:
+        agent = Agent(PidFile(PID_NAME, PID_DIR).get_path(), autorestart, in_developer_mode=in_developer_mode)
+
+    if command in START_COMMANDS:
+        log.info('Agent version %s' % get_version())
+
+    if 'start' == command:
+        log.info('Start daemon')
+        agent.start()
+
+    elif 'stop' == command:
+        log.info('Stop daemon')
+        agent.stop()
+
+    elif 'restart' == command:
+        log.info('Restart daemon')
+        agent.restart()
+
+    elif 'status' == command:
+        agent.status()
+
+    elif 'info' == command:
+        return Agent.info(verbose=options.verbose)
+
+    elif 'foreground' == command:
+        logging.info('Running in foreground')
+        if autorestart:
+            # Set-up the supervisor callbacks and fork it.
+            logging.info('Running Agent with auto-restart ON')
+
+            def child_func():
+                agent.start(foreground=True)
+
+            def parent_func():
+                agent.start_event = False
+
+            AgentSupervisor.start(parent_func, child_func)
+        else:
+            # Run in the standard foreground.
+            agent.start(foreground=True)
+
+    elif 'check' == command:
+        if len(args) < 2:
+            sys.stderr.write(
+                "Usage: %s check <check_name> [check_rate]\n"
+                "Add check_rate as last argument to compute rates\n"
+                % sys.argv[0]
+            )
+            return 1
+
+        check_name = args[1]
+        try:
+            import checks.collector
+            # Try the old-style check first
+            print getattr(checks.collector, check_name)(log).check(agentConfig)
+        except Exception:
+            # If not an old-style check, try checks.d
+            checks = load_check_directory(agentConfig, hostname)
+            for check in checks['initialized_checks']:
+                if check.name == check_name:
+                    if in_developer_mode:
+                        check.run = AgentProfiler.wrap_profiling(check.run)
+
+                    cs = Collector.run_single_check(check, verbose=True)
+                    print CollectorStatus.render_check_status(cs)
+
+                    if len(args) == 3 and args[2] == 'check_rate':
+                        print "Running 2nd iteration to capture rate metrics"
+                        time.sleep(1)
+                        cs = Collector.run_single_check(check, verbose=True)
+                        print CollectorStatus.render_check_status(cs)
+
+                    check.stop()
+
+    elif 'configcheck' == command or 'configtest' == command:
+        configcheck()
+        sd_configcheck(agentConfig)
+
+    elif 'jmx' == command:
+        jmx_command(args[1:], agentConfig)
+
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except StandardError:
+        # Try our best to log the error.
+        try:
+            log.exception("Uncaught error running the Agent")
+        except Exception:
+            pass
+        raise

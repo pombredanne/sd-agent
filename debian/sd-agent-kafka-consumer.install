@@ -1,0 +1,10 @@
+checks.d/kafka_consumer.py usr/share/python/sd-agent/checks.d
+conf.d/kafka_consumer.yaml.example etc/sd-agent/conf.d
+
+debian/build/lib/python2.7/site-packages/kafka usr/share/python/sd-agent/lib/python2.7/site-packages
+debian/build/lib/python2.7/site-packages/kafka_python-*-info usr/share/python/sd-agent/lib/python2.7/site-packages
+debian/build/lib/python2.7/site-packages/kazoo usr/share/python/sd-agent/lib/python2.7/site-packages
+debian/build/lib/python2.7/site-packages/kazoo-*-info usr/share/python/sd-agent/lib/python2.7/site-packages
+debian/build/lib/python2.7/site-packages/zope usr/share/python/sd-agent/lib/python2.7/site-packages
+debian/build/lib/python2.7/site-packages/zope.interface-*-info usr/share/python/sd-agent/lib/python2.7/site-packages
+debian/build/lib/python2.7/site-packages/zope.interface-*-nspkg.pth usr/share/python/sd-agent/lib/python2.7/site-packages

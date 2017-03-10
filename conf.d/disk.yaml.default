@@ -1,0 +1,12 @@
+init_config:
+
+instances:
+  # The (optional) excluded_filesystems parameter will instruct the check to
+  # ignore disks using these filesystems
+  - excluded_filesystems:
+    - tmpfs
+
+    # The (optional) all_partitions parameter will instruct the check to
+    # get metrics for all partitions. use_mount should be set to yes (to avoid
+    # collecting empty device names) when using this option.
+    # all_partitions: no

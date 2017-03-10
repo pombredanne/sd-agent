@@ -1,4 +1,0 @@
-{
-    "name": "Test Plugin",
-    "configKeys": ["username", "password"]
-}

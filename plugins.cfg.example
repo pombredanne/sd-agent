@@ -1,0 +1,9 @@
+#
+# You can add here settings for you plugin. Usually you add a section per
+# plugin and with each configuration setting you are interested on. So for
+# instance, for a MyPlugin plugin it would look like:
+#
+# [MyPlugin]
+#
+# setting_1: value1
+# setting_2: value2
